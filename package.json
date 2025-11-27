@@ -22,6 +22,7 @@
   "homepage": "https://github.com/sagarvaghasiya07/yt-down-backend#readme",
   "dependencies": {
     "axios": "^1.13.2",
+    "child_process": "^1.0.2",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "jsdom": "^27.2.0",
