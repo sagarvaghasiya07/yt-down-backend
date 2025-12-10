@@ -90,8 +90,28 @@ router.get("/youtube/download-fast", async (req, res) => {
         }
 
         const startTime = Date.now();
-        const data = await getVideoInfoFast(url);
+        let data;
+        try {
+            data = await getVideoInfoFast(url);
+        } catch (infoError) {
+            console.error('Error getting video info:', infoError);
+            return res.status(500).json({ 
+                error: infoError.message || infoError.toString(),
+                hint: "If this persists, try the /youtube/download endpoint as fallback"
+            });
+        }
+        
         const responseTime = Date.now() - startTime;
+
+        // Validate that we have at least some formats
+        if ((!data.merged || data.merged.length === 0) && 
+            (!data.videoOnly || data.videoOnly.length === 0) && 
+            (!data.audioOnly || data.audioOnly.length === 0)) {
+            return res.status(500).json({ 
+                error: "No formats available",
+                hint: "Video might be age-restricted, region-locked, or unavailable. Try /youtube/download as fallback."
+            });
+        }
 
         // Build base URL for proxy endpoints
         const baseUrl = `${req.protocol}://${req.get('host')}/api`;
@@ -111,20 +131,21 @@ router.get("/youtube/download-fast", async (req, res) => {
 
         res.json({
             ...data,
-            merged: data.merged.map(addProxyUrls),
-            videoOnly: data.videoOnly.map(addProxyUrls),
-            audioOnly: data.audioOnly.map(addProxyUrls),
+            merged: (data.merged || []).map(addProxyUrls),
+            videoOnly: (data.videoOnly || []).map(addProxyUrls),
+            audioOnly: (data.audioOnly || []).map(addProxyUrls),
             // General URLs for best quality
             streamUrl: `${baseUrl}/youtube/stream/${videoId}`,
             downloadUrl: `${baseUrl}/youtube/stream/${videoId}?download=true`,
             _meta: {
                 responseTime: `${responseTime}ms`,
                 source: "youtubei.js",
-                note: "Use 'streamUrl' for playback, 'downloadUrl' for file download. Direct 'url' may return 403 errors."
+                note: "Use 'streamUrl' for playback, 'downloadUrl' for file download. All URLs are proxied through this server to bypass IP restrictions."
             }
         });
 
     } catch (error) {
+        console.error('Download-fast endpoint error:', error);
         res.status(500).json({ 
             error: error.message || error.toString(),
             hint: "If this persists, try the /youtube/download endpoint as fallback"
@@ -165,12 +186,35 @@ router.get("/youtube/stream/:videoId", async (req, res) => {
             return res.status(400).json({ error: "Invalid video ID" });
         }
 
-        const result = await streamVideoWithYoutubei(
-            videoId, 
-            itag ? parseInt(itag) : null,
-            type,
-            quality
-        );
+        let result;
+        try {
+            result = await streamVideoWithYoutubei(
+                videoId, 
+                itag ? parseInt(itag) : null,
+                type,
+                quality
+            );
+        } catch (streamError) {
+            // If streaming fails, try with different type/quality as fallback
+            console.error(`Stream error for ${videoId}:`, streamError.message);
+            
+            // Try fallback: if merged fails, try audio
+            if (type === 'merged' || type === 'video') {
+                try {
+                    result = await streamVideoWithYoutubei(videoId, null, 'audio', 'best');
+                } catch (fallbackError) {
+                    return res.status(500).json({ 
+                        error: streamError.message || streamError.toString(),
+                        hint: "This video might be age-restricted, region-locked, or unavailable. Try using /youtube/download endpoint as fallback."
+                    });
+                }
+            } else {
+                return res.status(500).json({ 
+                    error: streamError.message || streamError.toString(),
+                    hint: "This video might be age-restricted, region-locked, or unavailable. Try using /youtube/download endpoint as fallback."
+                });
+            }
+        }
 
         // Handle live streams - redirect to HLS URL
         if (result.isLive) {
@@ -183,14 +227,22 @@ router.get("/youtube/stream/:videoId", async (req, res) => {
             });
         }
 
+        // Validate stream exists
+        if (!result.stream) {
+            return res.status(500).json({ 
+                error: "Stream not available",
+                hint: "Failed to create stream. Video might be unavailable."
+            });
+        }
+
         // Set appropriate headers
-        const contentType = result.format.mimeType || 'video/mp4';
+        const contentType = result.format?.mimeType || 'video/mp4';
         const fileExtension = contentType.includes('audio') ? 'm4a' : 'mp4';
         const safeTitle = (result.title || 'video').replace(/[^\w\s-]/g, '').trim();
         
         res.setHeader('Content-Type', contentType);
         
-        if (result.format.contentLength) {
+        if (result.format?.contentLength) {
             res.setHeader('Content-Length', result.format.contentLength);
         }
         
@@ -209,23 +261,35 @@ router.get("/youtube/stream/:videoId", async (req, res) => {
 
         // Handle stream errors
         result.stream.on('error', (err) => {
+            console.error('Stream pipe error:', err.message);
             if (!res.headersSent) {
                 res.status(500).json({ error: 'Stream error: ' + err.message });
+            } else {
+                // If headers already sent, just end the response
+                res.end();
             }
         });
 
         // Handle client disconnect
         req.on('close', () => {
-            if (result.stream.destroy) {
+            if (result.stream && result.stream.destroy) {
                 result.stream.destroy();
             }
         });
 
+        // Handle stream end
+        result.stream.on('end', () => {
+            if (!res.headersSent) {
+                res.end();
+            }
+        });
+
     } catch (error) {
+        console.error('Stream endpoint error:', error);
         if (!res.headersSent) {
             res.status(500).json({ 
                 error: error.message || error.toString(),
-                hint: "This video might be age-restricted or region-locked"
+                hint: "This video might be age-restricted or region-locked. Try /youtube/download as fallback."
             });
         }
     }
@@ -250,8 +314,43 @@ router.get("/youtube/v2", async (req, res) => {
         }
 
         const startTime = Date.now();
-        const data = await getCompleteVideoInfo(videoId);
+        let data;
+        try {
+            data = await getCompleteVideoInfo(videoId);
+        } catch (infoError) {
+            console.error('Error getting video info with getCompleteVideoInfo:', infoError);
+            // Fallback to getVideoInfoFast if getCompleteVideoInfo fails
+            try {
+                console.log('Attempting fallback with getVideoInfoFast...');
+                const fallbackData = await getVideoInfoFast(url);
+                // Convert fallback data to match getCompleteVideoInfo format
+                data = {
+                    ...fallbackData,
+                    description: "", // getVideoInfoFast doesn't provide description
+                    uploadDate: null // getVideoInfoFast doesn't provide uploadDate
+                };
+            } catch (fallbackError) {
+                console.error('Fallback also failed:', fallbackError);
+                return res.status(500).json({ 
+                    success: false,
+                    error: infoError.message || infoError.toString(),
+                    hint: "Video might be private, age-restricted, or region-locked. Try /youtube/download as fallback."
+                });
+            }
+        }
+        
         const responseTime = Date.now() - startTime;
+
+        // Validate that we have at least some formats
+        if ((!data.merged || data.merged.length === 0) && 
+            (!data.videoOnly || data.videoOnly.length === 0) && 
+            (!data.audioOnly || data.audioOnly.length === 0)) {
+            return res.status(500).json({ 
+                success: false,
+                error: "No formats available",
+                hint: "Video might be age-restricted, region-locked, or unavailable. Try /youtube/download as fallback."
+            });
+        }
 
         // Build base URL for stream endpoints
         const baseUrl = `${req.protocol}://${req.get('host')}/api`;
@@ -283,9 +382,9 @@ router.get("/youtube/v2", async (req, res) => {
             hlsUrl: data.hlsUrl,
             
             // Formats with proxy URLs
-            merged: data.merged.map(addUrls),
-            videoOnly: data.videoOnly.map(addUrls),
-            audioOnly: data.audioOnly.map(addUrls),
+            merged: (data.merged || []).map(addUrls),
+            videoOnly: (data.videoOnly || []).map(addUrls),
+            audioOnly: (data.audioOnly || []).map(addUrls),
             
             // Quick access URLs (best quality)
             quickStream: {
@@ -302,10 +401,11 @@ router.get("/youtube/v2", async (req, res) => {
         });
 
     } catch (error) {
+        console.error('V2 endpoint error:', error);
         res.status(500).json({ 
             success: false,
             error: error.message || error.toString(),
-            hint: "Video might be private, age-restricted, or region-locked"
+            hint: "Video might be private, age-restricted, or region-locked. Try /youtube/download as fallback."
         });
     }
 });
